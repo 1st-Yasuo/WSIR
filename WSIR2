@@ -1,0 +1,296 @@
+import math
+from functools import wraps
+from math import log, pi
+import random
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from einops import rearrange, reduce, repeat
+from einops.layers.torch import Rearrange, Reduce
+from torch import einsum, nn
+
+from models.pooling import MeanPooling, MaxPooling
+from models.TransMIL import TransMIL
+import models.dsmil as dsmil
+import models.abmil as abmil
+from models.clam import CLAM_SB, CLAM_MB
+
+
+def exists(val):
+    return val is not None
+
+
+def default(val, d):
+    return val if exists(val) else d
+
+
+def cache_fn(f):
+    cache = dict()
+
+    @wraps(f)
+    def cached_fn(*args, _cache=True, key=None, **kwargs):
+        if not _cache:
+            return f(*args, **kwargs)
+        nonlocal cache
+        if key in cache:
+            return cache[key]
+        result = f(*args, **kwargs)
+        cache[key] = result
+        return result
+
+    return cached_fn
+
+
+class PreNorm(nn.Module):
+    def __init__(self, dim, fn, context_dim=None):
+        super().__init__()
+        self.fn = fn
+        self.norm = nn.LayerNorm(dim)
+        self.norm_context = nn.LayerNorm(context_dim) if exists(context_dim) else None
+
+    def forward(self, x, **kwargs):
+        x = self.norm(x)
+
+        if exists(self.norm_context):
+            context = kwargs["context"]
+            normed_context = self.norm_context(context)
+            kwargs.update(context=normed_context)
+
+        return self.fn(x, **kwargs)
+
+
+class GEGLU(nn.Module):
+    def forward(self, x):
+        x, gates = x.chunk(2, dim=-1)
+        return x * F.gelu(gates)
+
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, mult=1, dropout=0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim * mult * 2),
+            GEGLU(),
+            nn.Linear(dim * mult, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Attention(nn.Module):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
+        super().__init__()
+        inner_dim = query_dim
+        self.scale = query_dim**-0.5
+        self.heads = heads
+        self.to_q = nn.Linear(query_dim, query_dim, bias=False)
+        context_dim = default(context_dim, query_dim)
+        self.to_kv = nn.Linear(context_dim, query_dim * 2, bias=False)
+        self.to_v = nn.Linear(context_dim, query_dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self.to_out = nn.Linear(query_dim, query_dim)
+
+    def forward(self, x, context=None):
+        h = self.heads
+        # q = self.to_q(x)
+        q = x
+        context = default(context, x)
+        k, v = self.to_kv(context).chunk(2, dim=-1)
+        # k, v = context, self.to_v(context)
+        # k, v = context, context
+        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> (b h) n d", h=h), (q, k, v))
+        sim = einsum("b i d, b j d -> b i j", q, k) * self.scale
+        attn = sim.softmax(dim=-1)
+        # attn = attn.detach()
+        attn = self.dropout(attn)
+        out = einsum("b i j, b j d -> b i d", attn, v)
+        out = rearrange(out, "(b h) n d -> b n (h d)", h=h)
+
+        # return out, sim
+        return self.to_out(out), sim
+
+
+class WSIR(nn.Module):
+    def __init__(self, context_dim, inner_dim=192, dropout=0.0):
+        super().__init__()
+        self.query_dim = inner_dim
+        self.query = nn.Parameter(torch.randn(1, self.query_dim))
+        self.norm = nn.LayerNorm(self.query_dim)
+        self.norm_context = nn.LayerNorm(context_dim)
+        self.inner_dim = inner_dim
+        self.scale = inner_dim**-0.5
+        self.to_q = nn.Linear(self.query_dim, inner_dim, bias=False)
+        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
+        self.to_v = nn.Linear(inner_dim, inner_dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, context, topk_ratio=1, reduction="topk"):
+        b, N, *_ = context.shape
+        cls_token = repeat(self.query, "n d -> b n d", b=b)
+        q = self.norm(self.to_q(cls_token))
+        context = self.norm_context(context)
+        k = self.to_k(context)
+        # k = context
+
+        sim = einsum("b i d, b j d -> b i j", q, k) * self.scale
+        attn = sim.softmax(dim=-1)
+        # attn = self.dropout(attn)
+        attn_weight = reduce(attn, "b i j -> i j", "mean")
+        if reduction == "topk":
+            if topk_ratio==1:
+                return k,_,_
+            else:
+                topk_n = int(N * topk_ratio)
+                _, active_idx = torch.topk(attn_weight, topk_n, dim=-1, largest=True, sorted=True)
+                active_ids = torch.unique(torch.flatten(active_idx))
+                total_ids = torch.ones(N)
+                total_ids[active_ids] = 0
+                inactive_ids = total_ids.bool()
+                active_tokens = torch.index_select(k, dim=1, index=active_ids)
+                inactive_tokens = self.to_v(k[:, inactive_ids, :])
+                non_topk_attn = attn[:, :, inactive_ids]
+                fuse_tokens = einsum("b i j, b j d -> b i d", non_topk_attn, inactive_tokens)
+                out = torch.concat([active_tokens, fuse_tokens], dim=1)
+                # out = active_tokens
+            return out, attn_weight, active_idx
+
+        elif reduction == "random":
+            num_elements = int(N * topk_ratio)
+            indices = torch.randperm(k.size(1))[:num_elements]
+            random_sample = k[:,indices,:]
+
+            return random_sample, attn_weight, indices
+        else:
+            active_idx = torch.ones(N)
+            return k, attn_weight, active_idx
+
+
+class MIL(nn.Module):
+
+    def __init__(
+        self,
+        input_dim=384,
+        num_classes=2,
+        attn_dropout=0.0,
+        ff_dropout=0.0,
+    ) -> None:
+        super().__init__()
+        self.cls_token = nn.Parameter(torch.randn(1, input_dim))
+        self.cross_attn = PreNorm(
+            input_dim,
+            Attention(
+                input_dim,
+                heads=1,
+                dropout=attn_dropout,
+            ),
+            context_dim=input_dim,
+        )
+        self.cross_ff = PreNorm(input_dim, FeedForward(input_dim, dropout=ff_dropout))
+        self.cross_attn_1 = PreNorm(
+            input_dim,
+            Attention(
+                input_dim,
+                heads=1,
+                dropout=attn_dropout,
+            ),
+            context_dim=input_dim,
+        )
+        self.cross_ff_1 = PreNorm(input_dim, FeedForward(input_dim, dropout=ff_dropout))
+        self.cross_attn_2 = PreNorm(
+            input_dim,
+            Attention(
+                input_dim,
+                heads=1,
+                dropout=attn_dropout,
+            ),
+            context_dim=input_dim,
+        )
+        self.cross_ff_2 = PreNorm(input_dim, FeedForward(input_dim, dropout=ff_dropout))
+        self.to_logits = nn.Sequential(
+            Rearrange("b n d -> b (n d)"), nn.Linear(input_dim, num_classes)
+        )
+
+    def forward(self, data):
+        b, *axis, _ = data.shape
+        data = rearrange(data, "b ... d -> b (...) d")
+        cls_token = repeat(self.cls_token, "n d -> b n d", b=b)
+        x, attn_map = self.cross_attn(cls_token, context=data)
+        x = x + cls_token
+        x = self.cross_ff(x) + x
+        x_1 = self.cross_attn_1(x, context=data)[0] + x
+        x_1 = self.cross_ff_1(x_1) + x_1
+        x_2 = self.cross_attn_2(x_1, context=data)[0] + x_1
+        x_2 = self.cross_ff_2(x_2) + x_2
+        x = x+x_1+x_2
+        return self.to_logits(x)
+
+
+class WR2MIL(nn.Module):
+    def __init__(
+        self,
+        input_dim=384,
+        inner_dim=64,
+        num_classes=2,
+        attn_dropout=0.0,
+        ff_dropout=0.0,
+        mil="default",
+    ):
+        super().__init__()
+        self.mil_name = mil
+        self.wsir = WSIR(input_dim, inner_dim, dropout=attn_dropout)
+        if mil == "default":
+            self.mil = MIL(
+                input_dim=inner_dim,
+                num_classes=num_classes,
+                attn_dropout=attn_dropout,
+                ff_dropout=ff_dropout,
+            )
+
+        elif mil == "abmil":
+            self.mil = abmil.GatedAttention(inner_dim, num_classes)
+        elif mil.lower() == "dsmil":
+            i_classifier = dsmil.FCLayer(in_size=inner_dim, out_size=num_classes).cuda()
+            b_classifier = dsmil.BClassifier(inner_dim, num_classes).cuda()
+            self.mil = dsmil.MILNet(i_classifier, b_classifier).cuda()
+        elif mil.lower() == "transmil":
+            self.mil = TransMIL(feats_dim=inner_dim, n_classes=num_classes)
+
+    def forward(self, data, topk_ratio=1,reduction='topk'):
+        b, *axis, _ = data.shape
+
+        data = rearrange(data, "b ... d -> b (...) d")
+        key_tokens, attn_weight, active_idx = self.wsir(data, topk_ratio,reduction)
+        if self.mil_name == "dsmil":
+            ins_prediction, bag_prediction, _, _ = self.mil(key_tokens.squeeze(0))
+            return (ins_prediction, bag_prediction, 0, 0)
+        elif self.mil_name == "transmil":
+            results_dict = self.mil(data=key_tokens)
+            return results_dict
+        else:
+            output = self.mil(key_tokens)
+            return output, attn_weight
+
+        # ins_prediction, output, _, _ = self.mil(key_tokens.squeeze(0))
+
+
+if __name__ == "__main__":
+    model = WR2MIL(
+        input_dim=384,
+        topk_n=32,
+        num_classes=2,
+        attn_dropout=0.0,
+        ff_dropout=0.0,
+    )
+    x = torch.randn(1, 100, 384)
+    y, attn = model(x)
+    print(y)
+
+    criterion = nn.BCEWithLogitsLoss()
+    loss = criterion(y, torch.tensor([[1, 0]]).float())
+    print(loss)
+    loss.backward()
+    print(y)
+    # print(attn.shape)
