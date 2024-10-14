@@ -1,3 +1,3 @@
-# WSIR$^2$
+# WSIR^2^
 
-## Implementation of WSIR
+## Implementation of WSIR^2^
